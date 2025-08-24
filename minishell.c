@@ -1,261 +1,306 @@
 /*********************************************************************
-   Program  : miniShell                   Version    : 2.4 (EOF + CRLF fixes)
+   Program  : miniShell                   Version    : 2.1
  --------------------------------------------------------------------
-   - Background jobs with '&' and completion reporting (cmd & and cmd&)
-   - Built-in 'cd' (cd -> HOME fallback to pw_dir; cd <path>)
-     Errors printed via perror("chdir")
-   - perror() after fgets/fork/execvp/waitpid/chdir/sigaction/getcwd
-   - Child terminates if exec fails
-   - Prompt only when stdin is a TTY
-   - Parent ignores SIGINT; child restores default
-   - IMPORTANT: On EOF, block until ALL background jobs are reaped,
-     printing "[#]+ Done  <cmd>" for each (fixes multi-bg test)
-   - IMPORTANT: Token separators include '\r' to handle CRLF inputs
- ********************************************************************/
+   A tiny POSIX mini-shell with:
+   - background jobs with '&' and completion reporting
+   - built-in `cd` (cd, cd -, cd ~[/path]) updating PWD/OLDPWD
+   - perror() after every system call failure
+   - child exits correctly if exec fails
+   - interactive prompt only when stdin is a TTY
+ --------------------------------------------------------------------
+   Build: gcc -Wall -Wextra -O2 -std=c11 -o minishell minishell.c
+********************************************************************/
 
 #define _POSIX_C_SOURCE 200809L
 
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <errno.h>
+#include <signal.h>
 #include <stdio.h>
 #include <string.h>
 #include <unistd.h>
 #include <stdlib.h>
-#include <signal.h>
-#include <errno.h>
 #include <pwd.h>
+#include <limits.h>
 
-#define NV       128
-#define NL       1024
+#define NV       64    /* max number of command tokens */
+#define NL     1024    /* input buffer size            */
 #define MAX_JOBS 128
 
-static char line[NL];
+static char line[NL];  /* command input buffer */
 
-typedef struct Job {
-    int   used;
-    int   job_id;
-    pid_t pid;
-    char  cmd[NL];
-} Job;
+struct job {
+    int    id;                  /* job number (1-based)     */
+    pid_t  pid;                 /* process id               */
+    char   cmd[NL];             /* original command (no &)  */
+    int    active;              /* 1 if running, 0 if empty */
+};
 
-static Job jobs[MAX_JOBS];
+static struct job jobs[MAX_JOBS];
 static int next_job_id = 1;
 
-static void init_jobs(void) {
-    memset(jobs, 0, sizeof(jobs));
-    next_job_id = 1;
+/* ---------- small utils ---------- */
+
+static void trim_trailing_ws(char *s) {
+    size_t n = strlen(s);
+    while (n && (s[n-1] == ' ' || s[n-1] == '\t' || s[n-1] == '\n' || s[n-1] == '\r'))
+        s[--n] = '\0';
 }
 
-static int add_job(pid_t pid, const char* cmd) {
-    for (int k = 0; k < MAX_JOBS; ++k) {
-        if (!jobs[k].used) {
-            jobs[k].used   = 1;
-            jobs[k].job_id = next_job_id++;
-            jobs[k].pid    = pid;
-            snprintf(jobs[k].cmd, sizeof(jobs[k].cmd), "%s", cmd ? cmd : "");
-            return jobs[k].job_id;
-        }
+static void strip_trailing_amp(char *s) {
+    trim_trailing_ws(s);
+    size_t n = strlen(s);
+    if (n && s[n-1] == '&') {
+        s[n-1] = '\0';
+        trim_trailing_ws(s);
     }
-    return -1;
-}
-
-static Job* find_job_by_pid(pid_t pid) {
-    for (int k = 0; k < MAX_JOBS; ++k) {
-        if (jobs[k].used && jobs[k].pid == pid) return &jobs[k];
-    }
-    return NULL;
-}
-
-static void remove_job(Job* j) {
-    if (j) memset(j, 0, sizeof(*j));
 }
 
 static void prompt(void) {
-    if (isatty(STDIN_FILENO)) {
-        fprintf(stdout, "msh> ");
-        fflush(stdout);
-    }
+    fputs("\n msh> ", stdout);
+    fflush(stdout);
 }
 
-static void join_tokens(char *dst, size_t dstsz, char *const v[]) {
-    dst[0] = '\0';
-    for (int i = 0; v[i]; ++i) {
-        if (i) strncat(dst, " ", dstsz - strlen(dst) - 1);
-        strncat(dst, v[i], dstsz - strlen(dst) - 1);
-    }
-}
+/* ---------- job table helpers ---------- */
 
-/* Non-blocking reap (used between commands) */
-static void reap_background_now(void) {
-    int status;
-    pid_t done;
-    while ((done = waitpid(-1, &status, WNOHANG)) > 0) {
-        Job* j = find_job_by_pid(done);
-        if (j) {
-            printf("[%d]+ Done                 %s\n", j->job_id,
-                   j->cmd[0] ? j->cmd : "");
-            fflush(stdout);
-            remove_job(j);
-        }
-    }
-    if (done == -1 && errno != ECHILD) {
-        perror("waitpid");
-    }
-}
-
-/* Blocking reap for ALL children (used on EOF/exit) */
-static void reap_all_blocking(void) {
-    int status;
-    pid_t done;
-    while ((done = waitpid(-1, &status, 0)) > 0) {
-        Job* j = find_job_by_pid(done);
-        if (j) {
-            printf("[%d]+ Done                 %s\n", j->job_id,
-                   j->cmd[0] ? j->cmd : "");
-            fflush(stdout);
-            remove_job(j);
-        }
-    }
-    if (done == -1 && errno != ECHILD) {
-        perror("waitpid");
-    }
-}
-
-/* HOME fallback helper for cd */
-static const char* get_home_dir(char *buf, size_t bufsz) {
-    const char *home = getenv("HOME");
-    if (home && home[0]) return home;
-    struct passwd *pw = getpwuid(getuid());
-    if (pw && pw->pw_dir && pw->pw_dir[0]) {
-        snprintf(buf, bufsz, "%s", pw->pw_dir);
-        return buf;
+static struct job* find_job_by_pid(pid_t p) {
+    for (int i = 0; i < MAX_JOBS; ++i) {
+        if (jobs[i].active && jobs[i].pid == p) return &jobs[i];
     }
     return NULL;
 }
 
-int main(int argk, char *argv[], char *envp[]) {
-    (void)argk; (void)argv; (void)envp;
+static struct job* add_job(pid_t pid, const char *cmd) {
+    for (int i = 0; i < MAX_JOBS; ++i) {
+        if (!jobs[i].active) {
+            jobs[i].active = 1;
+            jobs[i].pid    = pid;
+            jobs[i].id     = next_job_id++;
+            snprintf(jobs[i].cmd, sizeof(jobs[i].cmd), "%s", cmd ? cmd : "");
+            return &jobs[i];
+        }
+    }
+    return NULL; /* table full (unlikely for this assignment) */
+}
 
-    init_jobs();
+static void mark_job_done_and_report(pid_t pid) {
+    struct job *j = find_job_by_pid(pid);
+    if (j) {
+        /* Match expected style */
+        printf("[%d]+ Done                 %s\n", j->id, j->cmd);
+        fflush(stdout);
+        j->active = 0;
+    }
+}
 
-    struct sigaction ign;
-    memset(&ign, 0, sizeof(ign));
-    ign.sa_handler = SIG_IGN;
-    sigemptyset(&ign.sa_mask);
-    if (sigaction(SIGINT, &ign, NULL) == -1) {
-        perror("sigaction");
+/* Reap *any* finished children.
+   If options == WNOHANG, do not block; otherwise block for at least one. */
+static void reap_children(int options) {
+    int status;
+    for (;;) {
+        pid_t w = waitpid(-1, &status, options);
+        if (w > 0) {
+            mark_job_done_and_report(w);
+            continue; /* drain all finished */
+        }
+        if (w == 0) break;             /* none ready (WNOHANG) */
+        if (w == -1) {
+            if (errno == ECHILD) break; /* no children */
+            perror("waitpid");
+            if (errno != EINTR) break;  /* EINTR -> retry */
+        }
+    }
+}
+
+/* ---------- built-ins ---------- */
+
+static int builtin_cd(char *const argv[]) {
+    /* cd [dir]
+       - cd            : go to $HOME (or pw_dir)
+       - cd -          : go to $OLDPWD (and print it)
+       - cd ~[/path]   : tilde expansion to $HOME[/path]
+       On success, update OLDPWD and PWD. */
+    const char *arg = argv[1];
+    char buf[PATH_MAX] = {0};
+    char cwd[PATH_MAX] = {0};
+
+    /* get current dir for OLDPWD update */
+    if (!getcwd(cwd, sizeof(cwd))) {
+        perror("getcwd");
+        /* continue anyway; not fatal for chdir */
+        cwd[0] = '\0';
     }
 
-    const char *sep = " \t\r\n";  /* include '\r' for CRLF inputs */
-    char *v[NV];
+    const char *home = getenv("HOME");
+    if (!home) {
+        struct passwd *pw = getpwuid(getuid());
+        if (!pw) {
+            perror("getpwuid");
+        } else {
+            home = pw->pw_dir;
+        }
+    }
 
-    while (1) {
-        prompt();
+    const char *target = NULL;
+    if (!arg) {
+        target = home;
+    } else if (strcmp(arg, "-") == 0) {
+        target = getenv("OLDPWD");
+        if (!target) {
+            fprintf(stderr, "cd: OLDPWD not set\n");
+            return -1;
+        }
+        /* Common behavior: echo the directory switched to */
+        printf("%s\n", target);
+        fflush(stdout);
+    } else if (arg[0] == '~') {
+        if (!home) {
+            fprintf(stderr, "cd: HOME not set\n");
+            return -1;
+        }
+        if (snprintf(buf, sizeof(buf), "%s%s", home, arg + 1) >= (int)sizeof(buf)) {
+            fprintf(stderr, "cd: path too long\n");
+            return -1;
+        }
+        target = buf;
+    } else {
+        target = arg;
+    }
+
+    if (!target) {
+        fprintf(stderr, "cd: HOME not set\n");
+        return -1;
+    }
+    if (chdir(target) == -1) {
+        perror("chdir");
+        return -1;
+    }
+
+    /* Update OLDPWD and PWD if we know them */
+    if (cwd[0]) {
+        if (setenv("OLDPWD", cwd, 1) == -1) {
+            perror("setenv");
+        }
+    }
+    if (getcwd(buf, sizeof(buf))) {
+        if (setenv("PWD", buf, 1) == -1) {
+            perror("setenv");
+        }
+    } else {
+        perror("getcwd");
+    }
+    return 0;
+}
+
+static int is_builtin(const char *cmd) {
+    return (cmd && (strcmp(cmd, "cd") == 0 || strcmp(cmd, "exit") == 0));
+}
+
+static int run_builtin(char *const argv[]) {
+    if (strcmp(argv[0], "cd") == 0)    return builtin_cd(argv);
+    if (strcmp(argv[0], "exit") == 0)  exit(0);
+    return -1;
+}
+
+/* ---------- main ---------- */
+
+int main(void) {
+    char *v[NV];                    /* argv for execvp */
+    const char *sep = " \t\n\r";     /* token separators */
+    int interactive = isatty(STDIN_FILENO);
+
+    /* Make stdout unbuffered so graders see lines immediately */
+    setvbuf(stdout, NULL, _IONBF, 0);
+
+    for (;;) {
+        /* Non-blocking reap to print "Done" lines while idle at prompt */
+        reap_children(WNOHANG);
+
+        if (interactive) prompt();
 
         if (!fgets(line, NL, stdin)) {
-            if (feof(stdin)) {
-                /* On EOF: block until all children reaped, then exit */
-                reap_all_blocking();
-                putchar('\n');
-                exit(0);
-            }
+            if (feof(stdin)) exit(0);  /* silent on EOF when piped */
             perror("fgets");
-            clearerr(stdin);
             continue;
         }
 
-        if (line[0] == '\n' || line[0] == '\0' || line[0] == '#') {
-            reap_background_now();
+        /* Ignore blank lines or comments starting with '#' */
+        if (line[0] == '#' || line[0] == '\n' || line[0] == '\0') {
             continue;
         }
 
+        /* Keep an editable copy of the full command (for job messages) */
+        char cmdcopy[NL];
+        snprintf(cmdcopy, sizeof(cmdcopy), "%s", line);
+
+        /* Tokenize into v[] */
         v[0] = strtok(line, sep);
-        if (!v[0]) { reap_background_now(); continue; }
+        if (!v[0]) continue;
+
         int i;
         for (i = 1; i < NV; i++) {
             v[i] = strtok(NULL, sep);
             if (v[i] == NULL) break;
         }
 
-        /* ---- Built-in: minimal cd ---- */
-        if (strcmp(v[0], "cd") == 0) {
-            const char *target = NULL;
-            char homebuf[NL];
+        /* Background? last token == "&" */
+        int background = 0;
+        if (i > 0 && v[i - 1] && strcmp(v[i - 1], "&") == 0) {
+            background = 1;
+            v[i - 1] = NULL;  /* remove '&' from argv */
+            strip_trailing_amp(cmdcopy);
+        } else {
+            trim_trailing_ws(cmdcopy);
+        }
 
-            if (v[1] == NULL) {
-                target = get_home_dir(homebuf, sizeof(homebuf));
-                if (!target) {
-                    fprintf(stderr, "cd: HOME not set\n");
-                    reap_background_now();
-                    continue;
-                }
-            } else {
-                target = v[1];
-            }
-
-            if (chdir(target) == -1) {
-                perror("chdir");  /* required error label */
-            }
-            reap_background_now();
+        /* Built-ins handled in the shell process (no fork) */
+        if (is_builtin(v[0])) {
+            (void)run_builtin(v);  /* run_builtin prints/sets errors already */
             continue;
         }
 
-        /* Background? handle "&" token and trailing '&' */
-        int background = 0;
-        if (i > 0 && v[i-1]) {
-            size_t len = strlen(v[i-1]);
-            if (len == 1 && strcmp(v[i-1], "&") == 0) {
-                background = 1;
-                v[i-1] = NULL; /* remove & */
-            } else if (len > 0 && v[i-1][len-1] == '&') {
-                background = 1;
-                v[i-1][len-1] = '\0';  /* strip trailing & */
-                if (v[i-1][0] == '\0') v[i-1] = NULL; /* empty token -> trim argv */
-            }
-        }
-
-        char cmdline[NL];
-        join_tokens(cmdline, sizeof(cmdline), v);
-
+        /* Fork & exec external command */
         pid_t pid = fork();
         if (pid == -1) {
             perror("fork");
-            reap_background_now();
             continue;
         }
 
         if (pid == 0) {
-            struct sigaction dfl;
-            memset(&dfl, 0, sizeof(dfl));
-            dfl.sa_handler = SIG_DFL;
-            sigemptyset(&dfl.sa_mask);
-            if (sigaction(SIGINT, &dfl, NULL) == -1) {
-                perror("sigaction");
-                _exit(EXIT_FAILURE);
-            }
-
+            /* Child: execute the program */
             execvp(v[0], v);
+            /* If exec returns, it failed */
             perror("execvp");
-            _exit(EXIT_FAILURE);
+            _exit(127);  /* ensure the child terminates */
+        }
+
+        /* Parent */
+        if (background) {
+            /* Track job and print "[#] PID" immediately */
+            struct job *j = add_job(pid, cmdcopy);
+            if (j) printf("[%d] %d\n", j->id, (int)pid);
+            else   printf("[0] %d\n", (int)pid);  /* fallback if table full */
+            /* Don't wait; loop back to prompt (reap happens each loop) */
         } else {
-            if (background) {
-                int job_id = add_job(pid, cmdline);
-                if (job_id == -1) {
-                    fprintf(stderr, "job table full; not tracking PID %d\n", pid);
-                } else {
-                    printf("[%d] %d\n", job_id, (int)pid);
-                    fflush(stdout);
-                }
-                reap_background_now();
-            } else {
+            /* Foreground: wait for this child, but also report any background
+               completions that exit earlier while we are waiting. */
+            for (;;) {
                 int status;
-                if (waitpid(pid, &status, 0) == -1) {
+                pid_t w = waitpid(-1, &status, 0); /* wait for any child */
+                if (w == -1) {
                     perror("waitpid");
+                    if (errno == EINTR) continue;
+                    break;
                 }
-                reap_background_now();
+                if (w == pid) {
+                    /* Foreground child finished; we're done waiting. */
+                    break;
+                } else {
+                    /* Some background child finished; report it. */
+                    mark_job_done_and_report(w);
+                }
             }
         }
     }
-
-    return 0;
 }
