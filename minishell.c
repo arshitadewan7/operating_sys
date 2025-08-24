@@ -1,14 +1,16 @@
 /*********************************************************************
-   Program  : miniShell                   Version    : 2.3 (grader-minimal)
+   Program  : miniShell                   Version    : 2.4 (EOF + CRLF fixes)
  --------------------------------------------------------------------
-   Minimal features required by the assignment & typical autograders:
-   - Background jobs with '&' and completion reporting
-   - Built-in 'cd' (minimal): 'cd' -> HOME (fallback to pw_dir), 'cd <path>'
-     On error: perror("chdir")
+   - Background jobs with '&' and completion reporting (cmd & and cmd&)
+   - Built-in 'cd' (cd -> HOME fallback to pw_dir; cd <path>)
+     Errors printed via perror("chdir")
    - perror() after fgets/fork/execvp/waitpid/chdir/sigaction/getcwd
    - Child terminates if exec fails
    - Prompt only when stdin is a TTY
    - Parent ignores SIGINT; child restores default
+   - IMPORTANT: On EOF, block until ALL background jobs are reaped,
+     printing "[#]+ Done  <cmd>" for each (fixes multi-bg test)
+   - IMPORTANT: Token separators include '\r' to handle CRLF inputs
  ********************************************************************/
 
 #define _POSIX_C_SOURCE 200809L
@@ -83,10 +85,29 @@ static void join_tokens(char *dst, size_t dstsz, char *const v[]) {
     }
 }
 
-static void reap_background(void) {
+/* Non-blocking reap (used between commands) */
+static void reap_background_now(void) {
     int status;
     pid_t done;
     while ((done = waitpid(-1, &status, WNOHANG)) > 0) {
+        Job* j = find_job_by_pid(done);
+        if (j) {
+            printf("[%d]+ Done                 %s\n", j->job_id,
+                   j->cmd[0] ? j->cmd : "");
+            fflush(stdout);
+            remove_job(j);
+        }
+    }
+    if (done == -1 && errno != ECHILD) {
+        perror("waitpid");
+    }
+}
+
+/* Blocking reap for ALL children (used on EOF/exit) */
+static void reap_all_blocking(void) {
+    int status;
+    pid_t done;
+    while ((done = waitpid(-1, &status, 0)) > 0) {
         Job* j = find_job_by_pid(done);
         if (j) {
             printf("[%d]+ Done                 %s\n", j->job_id,
@@ -125,26 +146,31 @@ int main(int argk, char *argv[], char *envp[]) {
         perror("sigaction");
     }
 
-    const char *sep = " \t\n";
+    const char *sep = " \t\r\n";  /* include '\r' for CRLF inputs */
     char *v[NV];
 
     while (1) {
         prompt();
 
         if (!fgets(line, NL, stdin)) {
-            if (feof(stdin)) { putchar('\n'); exit(0); }
+            if (feof(stdin)) {
+                /* On EOF: block until all children reaped, then exit */
+                reap_all_blocking();
+                putchar('\n');
+                exit(0);
+            }
             perror("fgets");
             clearerr(stdin);
             continue;
         }
 
         if (line[0] == '\n' || line[0] == '\0' || line[0] == '#') {
-            reap_background();
+            reap_background_now();
             continue;
         }
 
         v[0] = strtok(line, sep);
-        if (!v[0]) { reap_background(); continue; }
+        if (!v[0]) { reap_background_now(); continue; }
         int i;
         for (i = 1; i < NV; i++) {
             v[i] = strtok(NULL, sep);
@@ -159,10 +185,8 @@ int main(int argk, char *argv[], char *envp[]) {
             if (v[1] == NULL) {
                 target = get_home_dir(homebuf, sizeof(homebuf));
                 if (!target) {
-                    /* If HOME is not set and no pw_dir, report via perror on chdir with NULL? */
-                    /* Better: print a simple diagnostic and continue. */
                     fprintf(stderr, "cd: HOME not set\n");
-                    reap_background();
+                    reap_background_now();
                     continue;
                 }
             } else {
@@ -170,13 +194,13 @@ int main(int argk, char *argv[], char *envp[]) {
             }
 
             if (chdir(target) == -1) {
-                perror("chdir");
+                perror("chdir");  /* required error label */
             }
-            reap_background();
+            reap_background_now();
             continue;
         }
 
-        /* ---- Background? handle "&" token and trailing '&' ---- */
+        /* Background? handle "&" token and trailing '&' */
         int background = 0;
         if (i > 0 && v[i-1]) {
             size_t len = strlen(v[i-1]);
@@ -186,7 +210,7 @@ int main(int argk, char *argv[], char *envp[]) {
             } else if (len > 0 && v[i-1][len-1] == '&') {
                 background = 1;
                 v[i-1][len-1] = '\0';  /* strip trailing & */
-                if (v[i-1][0] == '\0') v[i-1] = NULL; /* token empty -> trim argv */
+                if (v[i-1][0] == '\0') v[i-1] = NULL; /* empty token -> trim argv */
             }
         }
 
@@ -196,7 +220,7 @@ int main(int argk, char *argv[], char *envp[]) {
         pid_t pid = fork();
         if (pid == -1) {
             perror("fork");
-            reap_background();
+            reap_background_now();
             continue;
         }
 
@@ -222,13 +246,13 @@ int main(int argk, char *argv[], char *envp[]) {
                     printf("[%d] %d\n", job_id, (int)pid);
                     fflush(stdout);
                 }
-                reap_background();
+                reap_background_now();
             } else {
                 int status;
                 if (waitpid(pid, &status, 0) == -1) {
                     perror("waitpid");
                 }
-                reap_background();
+                reap_background_now();
             }
         }
     }
