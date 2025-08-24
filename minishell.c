@@ -1,22 +1,17 @@
 /*********************************************************************
-   Program  : miniShell                   Version    : 2.0 (Final)
+   Program  : miniShell                   Version    : 2.1 (Final+fixes)
  --------------------------------------------------------------------
    Minimal POSIX-compatible command-line interpreter for Assignment 1
    - Background jobs with '&' and completion reporting
-   - Built-in 'cd' with HOME fallback
+     * Handles both "cmd &" and "cmd&" (no space before &)
+   - Built-in 'cd' with:
+     * HOME fallback; if HOME is unset, use getpwuid(getuid())->pw_dir
+     * '~' expansion (cd ~, cd ~/path)
+     * 'cd -' to jump to previous directory
    - perror() after every relevant system call
    - Child terminates if exec() fails
    - Prompt only when stdin is a TTY (so pipes/tests are clean)
    - Parent ignores SIGINT; child restores default (Ctrl+C kills fg job)
-
-   Notes on changes & why:
-   * '&' background: track jobs by (job_id, pid, cmd) so we can print
-     "[#] PID" at start and "[#]+ Done  command" when they finish later.
-   * 'cd' must be built-in (no fork). Supports "cd" → $HOME and "cd path".
-   * perror after fgets/fork/execvp/waitpid/chdir/sigaction to satisfy
-     "perror after each system call" requirement.
-   * Child exits on exec error to avoid zombie/loops.
-   * Parent ignores SIGINT so Ctrl+C kills fg job, not the shell itself.
  ********************************************************************/
 
 #define _POSIX_C_SOURCE 200809L
@@ -29,6 +24,7 @@
 #include <stdlib.h>
 #include <signal.h>
 #include <errno.h>
+#include <pwd.h>
 
 #define NV       128    /* max number of command tokens */
 #define NL       1024   /* input buffer size */
@@ -102,8 +98,6 @@ static void reap_background(void) {
     while ((done = waitpid(-1, &status, WNOHANG)) > 0) {
         Job* j = find_job_by_pid(done);
         if (j) {
-            /* Match expected style (spacing similar to typical shells):
-               [#]+ Done                 <cmd> */
             printf("[%d]+ Done                 %s\n", j->job_id,
                    j->cmd[0] ? j->cmd : "");
             fflush(stdout);
@@ -113,6 +107,39 @@ static void reap_background(void) {
     if (done == -1 && errno != ECHILD) {
         perror("waitpid");
     }
+}
+
+/* ---- cd helpers ---- */
+
+static const char* get_home_dir(char *buf, size_t bufsz) {
+    const char *home = getenv("HOME");
+    if (home && home[0]) return home;
+    struct passwd *pw = getpwuid(getuid());
+    if (pw && pw->pw_dir && pw->pw_dir[0]) {
+        snprintf(buf, bufsz, "%s", pw->pw_dir);
+        return buf;
+    }
+    return NULL;
+}
+
+/* Expand leading ~ (tilde) using HOME / pw_dir */
+static void expand_tilde(char *dst, size_t dstsz, const char *src) {
+    if (src && src[0] == '~') {
+        char homebuf[NL];
+        const char *home = get_home_dir(homebuf, sizeof(homebuf));
+        if (home) {
+            if (src[1] == '\0') {
+                snprintf(dst, dstsz, "%s", home);
+            } else if (src[1] == '/') {
+                snprintf(dst, dstsz, "%s/%s", home, src + 2);
+            } else {
+                /* Not handling ~user form; copy as-is */
+                snprintf(dst, dstsz, "%s", src);
+            }
+            return;
+        }
+    }
+    snprintf(dst, dstsz, "%s", src ? src : "");
 }
 
 int main(int argk, char *argv[], char *envp[]) {
@@ -134,18 +161,20 @@ int main(int argk, char *argv[], char *envp[]) {
     const char *sep = " \t\n";
     char *v[NV];
 
+    /* Track previous directory for 'cd -' */
+    char prev_dir[NL] = "";
+
     while (1) {
         prompt();
 
-        /* fgets: add perror on error; retain EOF behavior from skeleton */
         if (!fgets(line, NL, stdin)) {
-            if (feof(stdin)) {      /* EOF (e.g., Ctrl+D or end of a pipe) */
+            if (feof(stdin)) {
                 putchar('\n');
                 exit(0);
             }
             perror("fgets");
             clearerr(stdin);
-            continue;               /* try next prompt */
+            continue;
         }
 
         /* Skip empty/comment lines (leading '#') */
@@ -163,21 +192,43 @@ int main(int argk, char *argv[], char *envp[]) {
             if (v[i] == NULL) break;
         }
 
-        /* Built-in: cd */
+        /* ---- Built-in: cd ---- */
         if (strcmp(v[0], "cd") == 0) {
+            char target_buf[NL];
             const char *target = NULL;
+
             if (v[1] == NULL) {
-                target = getenv("HOME");
+                target = get_home_dir(target_buf, sizeof(target_buf));
                 if (!target) {
                     fprintf(stderr, "cd: HOME not set\n");
                     reap_background();
                     continue;
                 }
+            } else if (strcmp(v[1], "-") == 0) {
+                if (prev_dir[0] == '\0') {
+                    fprintf(stderr, "cd: OLDPWD not set\n");
+                    reap_background();
+                    continue;
+                }
+                target = prev_dir;
             } else {
-                target = v[1];
+                expand_tilde(target_buf, sizeof(target_buf), v[1]);
+                target = target_buf;
             }
+
+            /* Save current dir to prev_dir (for 'cd -') */
+            char cwd[NL];
+            if (!getcwd(cwd, sizeof(cwd))) {
+                perror("getcwd");
+                cwd[0] = '\0';
+            }
+
             if (chdir(target) == -1) {
                 perror("chdir");
+            } else {
+                if (cwd[0]) {
+                    snprintf(prev_dir, sizeof(prev_dir), "%s", cwd);
+                }
             }
             reap_background();
             continue;
@@ -185,18 +236,23 @@ int main(int argk, char *argv[], char *envp[]) {
 
         /* Built-in: exit/quit */
         if (strcmp(v[0], "exit") == 0 || strcmp(v[0], "quit") == 0) {
-            /* Optionally wait for background jobs to finish */
             int status;
-            while (waitpid(-1, &status, 0) > 0) { /* no-op */ }
+            while (waitpid(-1, &status, 0) > 0) { /* wait all background */ }
             if (errno != ECHILD && errno != 0) perror("waitpid");
             break;
         }
 
-        /* Background? last token == "&" */
+        /* ---- Background? handle both "&" token and trailing '&' ---- */
         int background = 0;
-        if (i > 0 && v[i-1] && strcmp(v[i-1], "&") == 0) {
-            background = 1;
-            v[i-1] = NULL; /* remove & from argv */
+        if (i > 0 && v[i-1]) {
+            size_t len = strlen(v[i-1]);
+            if (len == 1 && strcmp(v[i-1], "&") == 0) {
+                background = 1;
+                v[i-1] = NULL; /* remove & */
+            } else if (len > 1 && v[i-1][len-1] == '&') {
+                background = 1;
+                v[i-1][len-1] = '\0'; /* strip trailing & from token */
+            }
         }
 
         /* Save command line (without '&') for job table / Done printing */
@@ -223,7 +279,6 @@ int main(int argk, char *argv[], char *envp[]) {
             }
 
             execvp(v[0], v);
-            /* If execvp returns, it's an error */
             perror("execvp");
             _exit(EXIT_FAILURE);
         } else {
@@ -233,19 +288,15 @@ int main(int argk, char *argv[], char *envp[]) {
                 if (job_id == -1) {
                     fprintf(stderr, "job table full; not tracking PID %d\n", pid);
                 } else {
-                    /* Start line: "[#] PID" */
                     printf("[%d] %d\n", job_id, (int)pid);
                     fflush(stdout);
                 }
-                /* Reap any other finished background jobs */
                 reap_background();
             } else {
-                /* Foreground: wait for this specific child */
                 int status;
                 if (waitpid(pid, &status, 0) == -1) {
                     perror("waitpid");
                 }
-                /* After foreground completes, also reap any bg completions */
                 reap_background();
             }
         }
